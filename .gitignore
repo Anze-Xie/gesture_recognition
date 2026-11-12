@@ -1,0 +1,30 @@
+# Python虚拟环境与编译缓存
+.venv/
+env/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# PyCharm 与主流 IDE / 编辑器配置
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 操作系统生成的隐藏文件
+# Windows 缩略图与系统文件
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS系统文件
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
