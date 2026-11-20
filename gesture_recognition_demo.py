@@ -87,6 +87,15 @@ class HandGeometryAnalyzer:
     FINGER_PIPS = [2, 6, 10, 14, 18]
     FINGER_MCPS = [1, 5, 9, 13, 17]
 
+    @classmethod
+    def annotate_hand_items(cls, hand_items: List[Dict]) -> Tuple[int, bool]:
+        """为本帧逐手记录补充 label、states、count，并返回总伸指数与是否双手齐全"""
+        for item in hand_items:
+            label, states, _ = cls.classify_rule_gesture(item["pts"])
+            item.update(label=label, states=states.copy(), count=sum(states))
+        total_count = sum(h["count"] for h in hand_items)
+        return total_count, len(hand_items) == 2
+
     @staticmethod
     def calc_distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
         """计算二维平面两点之间的欧氏距离 d = sqrt((x1-x2)^2 + (y1-y2)^2)"""
@@ -280,13 +289,23 @@ class SystemHardwareController:
         except Exception:
             self.hw_bri_available = False
 
-    def set_volume_from_distance(self, pinch_dist: float, min_dist: float = 25.0, max_dist: float = 180.0) -> int:
-        """将拇指与食指像素间距 [min_dist, max_dist] 线性映射到音量 [0, 100] 并滤波"""
-        raw_vol = float(np.interp(pinch_dist, [min_dist, max_dist], [0.0, 100.0]))
-        smooth_vol = int(round(self.vol_smoother.update(raw_vol)))
-        self.volume = smooth_vol
+    @staticmethod
+    def calc_normalized_pinch_0_5(pts: List[Tuple[int, int]], min_ratio: float = 0.15, max_ratio: float = 1.10) -> \
+    Tuple[float, float]:
+        """计算拇指(4)与食指(8)距离，并用关键点 0 与 5 的距离做归一化，抵消远近影响"""
+        if len(pts) <= 8:
+            return 0.0, 0.0
+        pinch_dist = math.hypot(pts[8][0] - pts[4][0], pts[8][1] - pts[4][1])
+        ref_0_5 = max(math.hypot(pts[5][0] - pts[0][0], pts[5][1] - pts[0][1]), 1.0)
+        raw_ratio = pinch_dist / ref_0_5
+        norm_ratio = float(np.clip((raw_ratio - min_ratio) / max(max_ratio - min_ratio, 1e-6), 0.0, 1.0))
+        return raw_ratio, norm_ratio
 
-        # 限制硬件 API 调用频率（最高约 15Hz），避免阻塞视频帧率
+    def set_volume_from_pinch_norm_0_5(self, pts: List[Tuple[int, int]]) -> Tuple[int, float]:
+        """基于 0-5 归一化后的捏合比例控制音量 [0, 100]"""
+        raw_ratio, norm_ratio = self.calc_normalized_pinch_0_5(pts)
+        smooth_vol = int(round(self.vol_smoother.update(norm_ratio * 100.0)))
+        self.volume = smooth_vol
         now = time.time()
         if now - self._last_hw_update > 0.06:
             if self.hw_vol_available and self.os_name == "Windows":
@@ -294,14 +313,14 @@ class SystemHardwareController:
                     self._win_volume.SetMasterVolumeLevelScalar(smooth_vol / 100.0, None)
                 except Exception:
                     pass
-        return smooth_vol
+        return smooth_vol, raw_ratio
 
-    def set_brightness_from_distance(self, pinch_dist: float, min_dist: float = 25.0, max_dist: float = 180.0) -> int:
-        """将拇指与食指像素间距 [min_dist, max_dist] 线性映射到屏幕亮度 [10, 100] 并滤波"""
-        raw_bri = float(np.interp(pinch_dist, [min_dist, max_dist], [10.0, 100.0]))
+    def set_brightness_from_pinch_norm_0_5(self, pts: List[Tuple[int, int]]) -> Tuple[int, float]:
+        """基于 0-5 归一化后的捏合比例控制屏幕亮度 [10, 100]"""
+        raw_ratio, norm_ratio = self.calc_normalized_pinch_0_5(pts)
+        raw_bri = float(np.interp(norm_ratio, [0.0, 1.0], [10.0, 100.0]))
         smooth_bri = int(round(self.bri_smoother.update(raw_bri)))
         self.brightness = smooth_bri
-
         now = time.time()
         if now - self._last_hw_update > 0.08:
             self._last_hw_update = now
@@ -310,7 +329,7 @@ class SystemHardwareController:
                     self._sbc.set_brightness(smooth_bri, display=0)
                 except Exception:
                     pass
-        return smooth_bri
+        return smooth_bri, raw_ratio
 
 
 # ==============================================================================
@@ -418,90 +437,142 @@ class LightweightKNNClassifier:
 
 class RockPaperScissorsGame:
     """
-    人机石头剪刀布对战系统 (Rock-Paper-Scissors AI Game)
-    规则映射：
-      - 0 / Fist (Rock)       -> Rock (石头)
-      - 2 / Yeah (Scissors)   -> Scissors (剪刀)
-      - 5 / Open Palm (Paper) -> Paper (布)
+    双人石头剪刀布对战系统 (Two-Player Rock-Paper-Scissors Game)
+    - 画面左半区 (wrist_x < w/2) 为 Player A，右半区 (wrist_x > w/2) 为 Player B
+    - 仅当 A/B 各一手且均为有效出招（石头/剪刀/布）时才允许启动倒计时
+    - 3 秒倒计时截止时，双方同帧组合需稳定持续 >= 0.3 秒才锁定并单次结算
     """
     MOVES = ["Rock", "Scissors", "Paper"]
+    VALID_RULES = {
+        ("0 / Fist (Rock)", (0, 0, 0, 0, 0)): "Rock",
+        ("2 / Yeah (Scissors)", (0, 1, 1, 0, 0)): "Scissors",
+        ("5 / Open Palm (Paper)", (1, 1, 1, 1, 1)): "Paper",
+    }
 
     def __init__(self):
-        self.player_score = 0
-        self.ai_score = 0
+        self.score_a = 0
+        self.score_b = 0
         self.state = "IDLE"  # IDLE, COUNTDOWN, RESULT
         self.countdown_start = 0.0
+        self.stable_start = 0.0
+        self.stable_pair: Optional[Tuple[str, str]] = None
         self.result_start = 0.0
-        self.last_player_move = "None"
-        self.last_ai_move = "None"
-        self.last_outcome = "Press [SPACE] to Start Round!"
+        self.last_move_a = "None"
+        self.last_move_b = "None"
+        self.last_outcome = "Both Players Ready (Left=A, Right=B), Press [SPACE]!"
 
-    def start_round(self):
-        self.state = "COUNTDOWN"
-        self.countdown_start = time.time()
+    @classmethod
+    def parse_valid_move(cls, item: Dict) -> Optional[str]:
+        """严格校验手势名称与五指状态编码是否同时匹配石头/剪刀/布"""
+        key = (item.get("label", ""), tuple(item.get("states", [])))
+        return cls.VALID_RULES.get(key)
+
+    @classmethod
+    def bind_players(cls, hand_items: List[Dict], frame_width: int) -> Tuple[Optional[Dict], Optional[Dict], str]:
+        """按镜像画面腕点 x 坐标绑定左右玩家区域（x < w/2 -> A，x > w/2 -> B）"""
+        if len(hand_items) != 2:
+            return None, None, f"Need 2 Hands (Current: {len(hand_items)})"
+        mid_x = frame_width / 2.0
+        left = [h for h in hand_items if h["pts"][0][0] < mid_x]
+        right = [h for h in hand_items if h["pts"][0][0] > mid_x]
+        if len(left) != 1 or len(right) != 1:
+            return None, None, "Invalid Position! Keep 1 Hand on Left (A) & 1 on Right (B)"
+        return left[0], right[0], "OK"
 
     @staticmethod
-    def map_gesture_to_move(gesture_name: str, finger_states: List[int]) -> Optional[str]:
-        up_cnt = sum(finger_states)
-        if "Fist" in gesture_name or up_cnt == 0:
-            return "Rock"
-        elif "Yeah" in gesture_name or finger_states[1:3] == [1, 1] and sum(finger_states[3:]) == 0:
-            return "Scissors"
-        elif "Open Palm" in gesture_name or up_cnt >= 4:
-            return "Paper"
-        return None
+    def judge_winner(move_a: str, move_b: str) -> str:
+        """独立判分函数：返回 'DRAW' / 'A_WIN' / 'B_WIN'"""
+        if move_a == move_b:
+            return "DRAW"
+        if (move_a == "Rock" and move_b == "Scissors") or \
+           (move_a == "Scissors" and move_b == "Paper") or \
+           (move_a == "Paper" and move_b == "Rock"):
+            return "A_WIN"
+        return "B_WIN"
 
-    def update(self, current_gesture: str, finger_states: List[int]) -> Dict[str, str]:
-        now = time.time()
+    def _cancel_round(self, reason: str):
+        self.state = "IDLE"
+        self.stable_pair = None
+        self.last_outcome = f"Round Canceled: {reason}"
+
+    def start_round(self, hand_items: List[Dict], frame_width: int):
+        """仅在 IDLE 且 A/B 各一手有效时允许启动倒计时"""
+        if self.state != "IDLE":
+            return
+        pa, pb, pos_msg = self.bind_players(hand_items, frame_width)
+        if pa is None or pb is None:
+            self.last_outcome = f"Cannot Start: {pos_msg}"
+            return
+        ma, mb = self.parse_valid_move(pa), self.parse_valid_move(pb)
+        if ma is None or mb is None:
+            self.last_outcome = "Cannot Start: Both must show Rock(0), Scissors(2), or Paper(5)!"
+            return
+        now = time.monotonic()
+        self.state = "COUNTDOWN"
+        self.countdown_start = now
+        self.stable_start = now
+        self.stable_pair = (ma, mb)
+
+    def update(self, hand_items: List[Dict], frame_width: int) -> Dict[str, str]:
+        now = time.monotonic()
+        pa, pb, pos_msg = self.bind_players(hand_items, frame_width)
+
         if self.state == "COUNTDOWN":
-            elapsed = now - self.countdown_start
-            remaining = 3.0 - elapsed
-            if remaining > 0:
-                return {
-                    "banner": f"Get Ready! Show Hand in {remaining:.1f}s...",
-                    "detail": f"Current Detected: {current_gesture}"
-                }
+            if pa is None or pb is None:
+                self._cancel_round(pos_msg)
             else:
-                # 倒计时结束，锁定玩家手势与 AI 随机出招
-                p_move = self.map_gesture_to_move(current_gesture, finger_states)
-                ai_move = random.choice(self.MOVES)
-                self.last_ai_move = ai_move
-                if p_move is None:
-                    self.last_player_move = "Invalid Gesture"
-                    self.last_outcome = "Unrecognized Move! Try Rock(0), Scissors(2), or Paper(5)."
+                ma, mb = self.parse_valid_move(pa), self.parse_valid_move(pb)
+                if ma is None or mb is None:
+                    self._cancel_round("Illegal Gesture Detected!")
                 else:
-                    self.last_player_move = p_move
-                    if p_move == ai_move:
-                        self.last_outcome = "DRAW! (平局)"
-                    elif (p_move == "Rock" and ai_move == "Scissors") or \
-                         (p_move == "Scissors" and ai_move == "Paper") or \
-                         (p_move == "Paper" and ai_move == "Rock"):
-                        self.player_score += 1
-                        self.last_outcome = "YOU WIN! (玩家获胜)"
+                    pair = (ma, mb)
+                    if pair != self.stable_pair:
+                        self.stable_pair = pair
+                        self.stable_start = now
+
+                    remaining = 3.0 - (now - self.countdown_start)
+                    if remaining > 0:
+                        return {
+                            "banner": f"Countdown: {remaining:.1f}s | A:{ma} vs B:{mb}",
+                            "detail": f"Score | Player A: {self.score_a}  :  Player B: {self.score_b}"
+                        }
+                    # 3 秒截止，检查同帧组合是否持续稳定 >= 0.3 秒
+                    if now - self.stable_start < 0.3:
+                        self._cancel_round("Moves Unstable (<0.3s) at Lock Time!")
                     else:
-                        self.ai_score += 1
-                        self.last_outcome = "AI WINS! (电脑获胜)"
-                self.state = "RESULT"
-                self.result_start = now
+                        self.last_move_a, self.last_move_b = ma, mb
+                        outcome = self.judge_winner(ma, mb)
+                        if outcome == "DRAW":
+                            self.last_outcome = "DRAW! (平局)"
+                        elif outcome == "A_WIN":
+                            self.score_a += 1
+                            self.last_outcome = "PLAYER A WINS! (+1)"
+                        else:
+                            self.score_b += 1
+                            self.last_outcome = "PLAYER B WINS! (+1)"
+                        self.state = "RESULT"
+                        self.result_start = now
 
         if self.state == "RESULT":
             if now - self.result_start > 4.0:
                 self.state = "IDLE"
             return {
-                "banner": f"Player: {self.last_player_move}  vs  AI: {self.last_ai_move}  -->  {self.last_outcome}",
-                "detail": f"Score | Player: {self.player_score}  :  AI: {self.ai_score}   (Press [SPACE] for Next Round)"
+                "banner": f"A: {self.last_move_a}  vs  B: {self.last_move_b}  -->  {self.last_outcome}",
+                "detail": f"Score | Player A: {self.score_a}  :  Player B: {self.score_b}   (Press [SPACE] Next Round)"
             }
 
+        live_hint = pos_msg
+        if pa is not None and pb is not None:
+            live_hint = f"A[{pa['label']}] | B[{pb['label']}]"
         return {
             "banner": self.last_outcome,
-            "detail": f"Score | Player: {self.player_score}  :  AI: {self.ai_score}   (Press [SPACE] to Play)"
+            "detail": f"Score A:{self.score_a} : B:{self.score_b} | Status: {live_hint}"
         }
 
 
 # ==============================================================================
 # 第五部分：OpenCV HUD 界面渲染与主循环引擎 (整合第 1、2、3 课全部内容)
 # ==============================================================================
-
 def draw_hud_panel(
     frame: np.ndarray,
     mode: int,
@@ -509,16 +580,23 @@ def draw_hud_panel(
     gesture_text: str,
     finger_states: List[int],
     hw_ctrl: SystemHardwareController,
+    hand_items: Optional[List[Dict]] = None,
+    total_finger_count: int = 0,
     rps_info: Optional[Dict[str, str]] = None,
     knn_info: Optional[str] = None
 ):
-    """在视频帧上绘制半透明科技感教学 HUD 仪表盘"""
+    """统一绘制无重叠的顶部状态区、逐手统计、模式横幅与底部提示栏"""
     h, w, _ = frame.shape
-    overlay = frame.copy()
+    hand_items = hand_items or []
 
-    # 顶部状态栏背景
-    cv2.rectangle(overlay, (0, 0), (w, 88), (24, 32, 44), -1)
-    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
+    # 计算顶部面板高度：基础顶栏(86) + 手数与逐手明细行 + 模式横幅区
+    detail_rows = 1 + len(hand_items)
+    banner_h = 66 if mode in (3, 4) and (rps_info or knn_info) else 0
+    panel_h = 86 + detail_rows * 22 + (banner_h + 10 if banner_h else 6)
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, panel_h), (24, 32, 44), -1)
+    cv2.addWeighted(overlay, 0.80, frame, 0.20, 0, frame)
 
     mode_titles = {
         1: "MODE 1: Geometric Gesture & Angle Inspector (Lesson 1 & 2)",
@@ -526,13 +604,62 @@ def draw_hud_panel(
         3: "MODE 3: Rock-Paper-Scissors AI Battle Game (Lesson 3 Game)",
         4: "MODE 4: Hybrid KNN Machine Learning Classifier (Path C Bonus)"
     }
-    cv2.putText(frame, mode_titles.get(mode, ""), (16, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 220, 255), 2)
-    cv2.putText(frame, f"FPS: {fps:.1f}", (w - 135, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (100, 255, 140), 2)
+    cv2.putText(frame, mode_titles.get(mode, ""), (16, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (80, 220, 255), 2)
+    cv2.putText(frame, f"FPS: {fps:.1f}", (w - 130, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (100, 255, 140), 2)
 
-    cv2.putText(frame, f"Gesture: {gesture_text} | Fingers[T,I,M,R,P]: {finger_states}",
-                (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (240, 240, 240), 2)
+    cv2.putText(frame, f"Summary: {gesture_text} | Last Fingers[T,I,M,R,P]: {finger_states}",
+                (16, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (240, 240, 240), 1)
+
+    # 统一绘制当前帧手数、总伸指数与逐手明细（不再单独在外部乱画重叠）
+    y_cur = 80
+    cv2.putText(frame, f"Hands: {len(hand_items)} | Total Fingers: {total_finger_count}",
+                (16, y_cur), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 215, 255), 2)
+    for idx_h, h_item in enumerate(hand_items):
+        y_cur += 22
+        cv2.putText(frame,
+                    f"Hand {idx_h}: {h_item.get('label', '')} | states={h_item.get('states', [])} | cnt={h_item.get('count', 0)}",
+                    (28, y_cur), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 240, 150), 1)
+
+    # 模式横幅统一放在逐手明细下方，彻底避免重叠
+    if mode == 3 and rps_info:
+        by1 = y_cur + 10
+        by2 = by1 + banner_h
+        cv2.line(frame, (w // 2, by2), (w // 2, h - 34), (100, 180, 255), 2)
+        cv2.putText(frame, "PLAYER A (Left)", (20, h - 46), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (100, 255, 220), 2)
+        cv2.putText(frame, "PLAYER B (Right)", (w - 225, h - 46), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 200, 100), 2)
+
+        cv2.rectangle(frame, (16, by1), (w - 16, by2), (35, 48, 70), -1)
+        cv2.putText(frame, rps_info["banner"], (28, by1 + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (100, 255, 220), 2)
+        cv2.putText(frame, rps_info["detail"], (28, by1 + 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (230, 235, 240), 1)
+
+    elif mode == 4 and knn_info:
+        by1 = y_cur + 10
+        by2 = by1 + 52
+        cv2.rectangle(frame, (16, by1), (w - 16, by2), (45, 35, 65), -1)
+        cv2.putText(frame, knn_info, (28, by1 + 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 100), 2)
+
+    # 模式 2 专属：左右侧进度条放在顶部面板下方，避免遮挡
+    if mode == 2:
+        bar_top = max(panel_h + 24, 150)
+        bar_bot = h - 65
+        bx1, bx2 = 28, 56
+        cv2.rectangle(frame, (bx1, bar_top), (bx2, bar_bot), (200, 200, 200), 2)
+        fill_h_bri = int(np.interp(hw_ctrl.brightness, [0, 100], [bar_bot, bar_top]))
+        cv2.rectangle(frame, (bx1 + 2, fill_h_bri), (bx2 - 2, bar_bot - 2), (60, 210, 255), -1)
+        cv2.putText(frame, f"BRI: {int(hw_ctrl.brightness)}%", (16, bar_top - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 210, 255), 2)
+
+        vx1, vx2 = w - 58, w - 30
+        cv2.rectangle(frame, (vx1, bar_top), (vx2, bar_bot), (200, 200, 200), 2)
+        fill_h_vol = int(np.interp(hw_ctrl.volume, [0, 100], [bar_bot, bar_top]))
+        cv2.rectangle(frame, (vx1 + 2, fill_h_vol), (vx2 - 2, bar_bot - 2), (100, 240, 120), -1)
+        cv2.putText(frame, f"VOL: {int(hw_ctrl.volume)}%", (w - 120, bar_top - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 240, 120), 2)
 
     # 底部按键提示栏
     cv2.rectangle(frame, (0, h - 34), (w, h), (20, 24, 32), -1)
@@ -540,38 +667,17 @@ def draw_hud_panel(
     cv2.putText(frame, help_str, (12, h - 11),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (190, 210, 230), 1)
 
-    # 模式 2 专属：绘制左右侧音量与亮度实时进度条
-    if mode == 2:
-        # 左侧亮度条 (Brightness)
-        bx1, by1, bx2, by2 = 28, 130, 56, h - 70
-        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (200, 200, 200), 2)
-        fill_h_bri = int(np.interp(hw_ctrl.brightness, [0, 100], [by2, by1]))
-        cv2.rectangle(frame, (bx1 + 2, fill_h_bri), (bx2 - 2, by2 - 2), (60, 210, 255), -1)
-        cv2.putText(frame, f"BRI: {int(hw_ctrl.brightness)}%", (16, by1 - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 210, 255), 2)
-
-        # 右侧音量条 (Volume)
-        vx1, vy1, vx2, vy2 = w - 58, 130, w - 30, h - 70
-        cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), (200, 200, 200), 2)
-        fill_h_vol = int(np.interp(hw_ctrl.volume, [0, 100], [vy2, vy1]))
-        cv2.rectangle(frame, (vx1 + 2, fill_h_vol), (vx2 - 2, vy2 - 2), (100, 240, 120), -1)
-        cv2.putText(frame, f"VOL: {int(hw_ctrl.volume)}%", (w - 115, vy1 - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 240, 120), 2)
-
-    # 模式 3 专属：绘制石头剪刀布对战横幅
-    elif mode == 3 and rps_info:
-        cv2.rectangle(frame, (20, 98), (w - 20, 168), (35, 45, 65), -1)
-        cv2.putText(frame, rps_info["banner"], (32, 126),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (100, 255, 220), 2)
-        cv2.putText(frame, rps_info["detail"], (32, 155),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1)
-
-    # 模式 4 专属：绘制 KNN 训练与推理状态栏
-    elif mode == 4 and knn_info:
-        cv2.rectangle(frame, (20, 98), (w - 20, 150), (45, 35, 65), -1)
-        cv2.putText(frame, knn_info, (32, 130),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 200, 100), 2)
-
+def collect_and_highlight_hand(
+    frame: np.ndarray,
+    hand_idx: int,
+    pts: List[Tuple[int, int]],
+    hand_items: List[Dict],
+    highlight_tips: Tuple[int, ...] = (4, 8),) -> None:
+    """记录单只手的 21 点坐标并高亮指定指尖（默认 4 号拇指尖、8 号食指尖）"""
+    hand_items.append({"index": hand_idx, "pts": pts})
+    for tip in highlight_tips:
+        if tip < len(pts):
+            cv2.circle(frame, pts[tip], 10, (0, 255, 255), -1)
 
 def run_live_camera_demo(camera_index: int = 0):
     """启动电脑自带摄像头，运行交互式手势识别主程序"""
@@ -629,6 +735,7 @@ def run_live_camera_demo(camera_index: int = 0):
             gesture_label = "No Hand"
             finger_states = [0, 0, 0, 0, 0]
             latest_feature_vec = None
+            hand_items: List[Dict] = []
 
             # 2. 解析检测到的手部关键点
             if results.multi_hand_landmarks:
@@ -648,6 +755,8 @@ def run_live_camera_demo(camera_index: int = 0):
                         px, py = int(lm.x * w), int(lm.y * h)
                         pts.append((px, py))
 
+                    collect_and_highlight_hand(frame, hand_idx, pts, hand_items, (4, 8))
+
                     # 获取左右手标签
                     handedness_label = "Right"
                     if results.multi_handedness and hand_idx < len(results.multi_handedness):
@@ -664,29 +773,36 @@ def run_live_camera_demo(camera_index: int = 0):
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 230, 80), 2)
 
                     # 模式 2：拇指(4)与食指(8)捏合线控制音量（右手）或屏幕亮度（左手）
-                    elif current_mode == 2:
-                        p_thumb, p_index = pts[4], pts[8]
-                        cx, cy = (p_thumb[0] + p_index[0]) // 2, (p_thumb[1] + p_index[1]) // 2
-                        pinch_d = metrics["pinch_dist"]
-                        cv2.line(frame, p_thumb, p_index, (0, 255, 180), 3)
-                        cv2.circle(frame, (cx, cy), 10, (0, 140, 255) if pinch_d < 35 else (0, 255, 180), -1)
+                    elif current_mode == 2 and len(pts) > 8:
+                        p0, p5 = pts[0], pts[5]
+                        p4, p8 = pts[4], pts[8]
+                        mx, my = (p4[0] + p8[0]) // 2, (p4[1] + p8[1]) // 2
+                        cv2.line(frame, p4, p8, (0, 255, 180), 3)
+                        cv2.line(frame, p0, p5, (255, 180, 0), 2)
 
                         if handedness_label == "Right":
-                            vol_val = hw_ctrl.set_volume_from_distance(pinch_d)
-                            cv2.putText(frame, f"VOL: {vol_val}% ({int(pinch_d)}px)", (cx + 14, cy),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 120), 2)
+                            vol_val, ratio_0_5 = hw_ctrl.set_volume_from_pinch_norm_0_5(pts)
+                            cv2.putText(frame, f"VOL: {vol_val}% (r05:{ratio_0_5:.2f})",
+                                        (mx + 14, my), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 120), 2)
                         else:
-                            bri_val = hw_ctrl.set_brightness_from_distance(pinch_d)
-                            cv2.putText(frame, f"BRI: {bri_val}% ({int(pinch_d)}px)", (cx + 14, cy),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 210, 255), 2)
-
+                            bri_val, ratio_0_5 = hw_ctrl.set_brightness_from_pinch_norm_0_5(pts)
+                            cv2.putText(frame, f"BRI: {bri_val}% (r05:{ratio_0_5:.2f})",
+                                        (mx + 14, my), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 210, 255), 2)
                     # 模式 4：若 KNN 已训练，用 KNN 推理结果覆盖显示
                     elif current_mode == 4 and knn_clf.is_trained:
                         knn_pred, knn_conf = knn_clf.predict(latest_feature_vec)
                         gesture_label = f"KNN: {knn_pred} ({knn_conf*100:.0f}%)"
 
-            # 3. 更新模式 3 游戏状态机
-            rps_info = rps_game.update(gesture_label, finger_states) if current_mode == 3 else None
+            total_finger_count = 0
+            if hand_items:
+                total_finger_count, _ = HandGeometryAnalyzer.annotate_hand_items(hand_items)
+                gesture_label = " | ".join(f"H{h['index']}:{h['label']}({h['count']})" for h in hand_items)
+                finger_states = hand_items[-1]["states"]
+            else:
+                gesture_label = "Missing Hand (无手)"
+
+            # 3. 更新模式 3 双人游戏状态机
+            rps_info = rps_game.update(hand_items, w) if current_mode == 3 else None
             knn_info = f"Samples: {len(knn_clf.y_train)} | {status_msg}" if current_mode == 4 else None
 
             # 4. 计算实时帧率 FPS 并渲染 HUD
@@ -694,7 +810,11 @@ def run_live_camera_demo(camera_index: int = 0):
             fps = 1.0 / max(curr_time - prev_time, 1e-5)
             prev_time = curr_time
 
-            draw_hud_panel(frame, current_mode, fps, gesture_label, finger_states, hw_ctrl, rps_info, knn_info)
+            draw_hud_panel(
+                frame, current_mode, fps, gesture_label, finger_states, hw_ctrl,
+                hand_items=hand_items, total_finger_count=total_finger_count,
+                rps_info=rps_info, knn_info=knn_info
+            )
             cv2.imshow("AI Lab: Hand Gesture Recognition & HCI System", frame)
 
             # 5. 键盘事件响应
@@ -704,7 +824,7 @@ def run_live_camera_demo(camera_index: int = 0):
             elif key in (ord('1'), ord('2'), ord('3'), ord('4')):
                 current_mode = int(chr(key))
             elif key == ord(' ') and current_mode == 3:
-                rps_game.start_round()
+                rps_game.start_round(hand_items, w)
             elif current_mode == 4 and key in (ord('0'), ord('1'), ord('2'), ord('3')):
                 if latest_feature_vec is not None:
                     lbl = int(chr(key))
@@ -764,8 +884,8 @@ def run_offline_self_test():
 
     # 4. 测试音量/亮度控制器与 EMA 滤波器
     hw = SystemHardwareController(enable_hardware=False)
-    v1 = hw.set_volume_from_distance(150.0)
-    b1 = hw.set_brightness_from_distance(90.0)
+    v1, _ = hw.set_volume_from_pinch_norm_0_5(open_palm_pts)
+    b1, _ = hw.set_brightness_from_pinch_norm_0_5(open_palm_pts)
     print(f"[Test 4 - HCI EMA]   Smoothed Volume: {v1}% | Smoothed Brightness: {b1}%")
 
     # 5. 测试路径 C 归一化特征提取与 KNN 分类器
@@ -782,7 +902,28 @@ def run_offline_self_test():
     print(f"[Test 5 - Path C ML] {msg} -> Predicted: {pred_lbl} (Confidence: {conf*100:.1f}%)")
     if os.path.exists(tmp_csv):
         os.remove(tmp_csv)
+    # 6. 验证双人石头剪刀布九种组合与异常不计分规则
+    expected_9 = {
+        ("Rock", "Rock"): "DRAW", ("Rock", "Scissors"): "A_WIN", ("Rock", "Paper"): "B_WIN",
+        ("Scissors", "Rock"): "B_WIN", ("Scissors", "Scissors"): "DRAW", ("Scissors", "Paper"): "A_WIN",
+        ("Paper", "Rock"): "A_WIN", ("Paper", "Scissors"): "B_WIN", ("Paper", "Paper"): "DRAW",
+    }
+    for (ma, mb), exp in expected_9.items():
+        got = RockPaperScissorsGame.judge_winner(ma, mb)
+        assert got == exp, f"RPS 9-grid mismatch for ({ma}, {mb}): expected {exp}, got {got}"
 
+    # 验证异常边界（缺手 / 两手同区 / 非法手势）均不可启动且不计分
+    g_test = RockPaperScissorsGame()
+    mock_left_rock = [{"pts": [(200, 300)], "label": "0 / Fist (Rock)", "states": [0, 0, 0, 0, 0]}]
+    mock_left_rock_2 = [{"pts": [(250, 300)], "label": "0 / Fist (Rock)", "states": [0, 0, 0, 0, 0]}]
+    mock_right_illegal = [{"pts": [(900, 300)], "label": "1 / One", "states": [0, 1, 0, 0, 0]}]
+    g_test.start_round(mock_left_rock, 1280)  # 缺手
+    assert g_test.state == "IDLE" and g_test.score_a == 0 and g_test.score_b == 0
+    g_test.start_round(mock_left_rock + mock_left_rock_2, 1280)  # 同在左半区
+    assert g_test.state == "IDLE" and g_test.score_a == 0 and g_test.score_b == 0
+    g_test.start_round(mock_left_rock + mock_right_illegal, 1280)  # 右侧非法手势
+    assert g_test.state == "IDLE" and g_test.score_a == 0 and g_test.score_b == 0
+    print("[Test 6 - 2P RPS]    All 9 move combinations & invalid-input guards passed!")
     print("=== All Self-Tests Passed Successfully! ===")
 
 
